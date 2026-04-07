@@ -248,78 +248,63 @@ fn generate_hash_state<H: PhfHash>(entries: &[H]) -> HashState {
 }
 
 #[derive(Clone)]
-struct Key {
-    parsed: Vec<ParsedKey>,
-    expr: Vec<Expr>,
+struct KeyPattern {
+    variants: Vec<(ParsedKey, Expr)>,
     attrs: Vec<syn::Attribute>,
 }
 
-impl PhfHash for Key {
-    fn phf_hash<H>(&self, state: &mut H)
-    where
-        H: Hasher,
-    {
-        // For OR patterns, we hash the first key (they should all hash to the same value)
-        if let Some(first) = self.parsed.first() {
-            first.phf_hash(state);
-        }
-    }
-}
-
-impl Parse for Key {
-    fn parse(input: ParseStream<'_>) -> parse::Result<Key> {
+impl Parse for KeyPattern {
+    fn parse(input: ParseStream<'_>) -> parse::Result<KeyPattern> {
         let attrs = input.call(syn::Attribute::parse_outer)?;
 
         // Parse the expression (which might contain OR patterns)
         let expr = input.parse::<Expr>()?;
 
         // Extract all keys from the expression (handling OR patterns)
-        let (exprs, parsed_keys) = extract_keys_from_expr(&expr)?;
+        let mut variants = Vec::new();
+        extract_variants_from_expr(&expr, &mut variants)?;
 
-        Ok(Key {
-            parsed: parsed_keys,
-            expr: exprs,
-            attrs,
-        })
+        Ok(KeyPattern { variants, attrs })
     }
 }
 
 /// Extract all keys from an expression, handling OR patterns
-fn extract_keys_from_expr(expr: &Expr) -> parse::Result<(Vec<Expr>, Vec<ParsedKey>)> {
-    match expr {
-        Expr::Binary(binary) => {
-            if let BinOp::BitOr(_) = binary.op {
-                // Handle OR pattern: left | right
-                let (left_exprs, left_keys) = extract_keys_from_expr(&binary.left)?;
-                let (right_exprs, right_keys) = extract_keys_from_expr(&binary.right)?;
-
-                let mut exprs = left_exprs;
-                exprs.extend(right_exprs);
-
-                let mut keys = left_keys;
-                keys.extend(right_keys);
-
-                Ok((exprs, keys))
-            } else {
-                // Single key
-                let parsed = ParsedKey::from_expr(expr)
-                    .ok_or_else(|| Error::new_spanned(expr, "unsupported key expression"))?;
-                Ok((vec![expr.clone()], vec![parsed]))
-            }
+fn extract_variants_from_expr(expr: &Expr, out: &mut Vec<(ParsedKey, Expr)>) -> parse::Result<()> {
+    if let Expr::Binary(binary) = expr {
+        if let BinOp::BitOr(_) = binary.op {
+            // Handle OR pattern: left | right
+            extract_variants_from_expr(&binary.left, out)?;
+            extract_variants_from_expr(&binary.right, out)?;
+            return Ok(());
         }
-        _ => {
-            // Single key
-            let parsed = ParsedKey::from_expr(expr)
-                .ok_or_else(|| Error::new_spanned(expr, "unsupported key expression"))?;
-            Ok((vec![expr.clone()], vec![parsed]))
-        }
+    }
+    // Single key
+    let parsed = ParsedKey::from_expr(expr)
+        .ok_or_else(|| Error::new_spanned(expr, "unsupported key expression"))?;
+    out.push((parsed, expr.clone()));
+    Ok(())
+}
+
+#[derive(Clone)]
+struct EntryPattern {
+    key: KeyPattern,
+    value: Expr,
+}
+
+impl Parse for EntryPattern {
+    fn parse(input: ParseStream<'_>) -> parse::Result<EntryPattern> {
+        let key = input.parse()?;
+        input.parse::<Token![=>]>()?;
+        let value = input.parse()?;
+        Ok(EntryPattern { key, value })
     }
 }
 
 #[derive(Clone)]
 struct Entry {
-    key: Key,
-    value: Expr,
+    parsed_key: ParsedKey,
+    key_expr: Expr,
+    value_expr: Expr,
     attrs: Vec<syn::Attribute>,
 }
 
@@ -328,17 +313,7 @@ impl PhfHash for Entry {
     where
         H: Hasher,
     {
-        self.key.phf_hash(state)
-    }
-}
-
-impl Parse for Entry {
-    fn parse(input: ParseStream<'_>) -> parse::Result<Entry> {
-        let attrs = input.call(syn::Attribute::parse_outer)?;
-        let key = input.parse()?;
-        input.parse::<Token![=>]>()?;
-        let value = input.parse()?;
-        Ok(Entry { key, value, attrs })
+        self.parsed_key.phf_hash(state)
     }
 }
 
@@ -346,42 +321,27 @@ struct Map(Vec<Entry>);
 
 impl Parse for Map {
     fn parse(input: ParseStream<'_>) -> parse::Result<Map> {
-        let parsed = Punctuated::<Entry, Token![,]>::parse_terminated(input)?;
-        let mut expanded_entries = Vec::new();
+        let parsed = Punctuated::<EntryPattern, Token![,]>::parse_terminated(input)?;
+        let mut entries = Vec::new();
 
         // Expand OR patterns into multiple entries
-        for entry in parsed {
-            for (i, (parsed_key, expr)) in entry
-                .key
-                .parsed
-                .iter()
-                .zip(entry.key.expr.iter())
-                .enumerate()
-            {
-                let expanded_key = Key {
-                    parsed: vec![parsed_key.clone()],
-                    expr: vec![expr.clone()],
+        for entry_pattern in parsed {
+            for (i, (parsed_key, key_expr)) in entry_pattern.key.variants.into_iter().enumerate() {
+                entries.push(Entry {
+                    parsed_key,
+                    key_expr,
+                    value_expr: entry_pattern.value.clone(),
                     attrs: if i == 0 {
-                        entry.key.attrs.clone()
+                        entry_pattern.key.attrs.clone()
                     } else {
                         Vec::new()
                     },
-                };
-                let expanded_entry = Entry {
-                    key: expanded_key,
-                    value: entry.value.clone(),
-                    attrs: if i == 0 {
-                        entry.attrs.clone()
-                    } else {
-                        Vec::new()
-                    },
-                };
-                expanded_entries.push(expanded_entry);
+                });
             }
         }
 
-        check_duplicates(&expanded_entries)?;
-        Ok(Map(expanded_entries))
+        check_duplicates(&entries)?;
+        Ok(Map(entries))
     }
 }
 
@@ -389,48 +349,37 @@ struct Set(Vec<Entry>);
 
 impl Parse for Set {
     fn parse(input: ParseStream<'_>) -> parse::Result<Set> {
-        let parsed = Punctuated::<Key, Token![,]>::parse_terminated(input)?;
+        let parsed = Punctuated::<KeyPattern, Token![,]>::parse_terminated(input)?;
         let unit_value: Expr = syn::parse_str("()").expect("Failed to parse unit value");
 
-        let mut expanded_entries = Vec::new();
+        let mut entries = Vec::new();
 
         // Expand OR patterns into multiple entries
-        for key in parsed {
-            for (i, (parsed_key, expr)) in key.parsed.iter().zip(key.expr.iter()).enumerate() {
-                let expanded_key = Key {
-                    parsed: vec![parsed_key.clone()],
-                    expr: vec![expr.clone()],
+        for key_pattern in parsed {
+            for (i, (parsed_key, key_expr)) in key_pattern.variants.into_iter().enumerate() {
+                entries.push(Entry {
+                    parsed_key,
+                    key_expr,
+                    value_expr: unit_value.clone(),
                     attrs: if i == 0 {
-                        key.attrs.clone()
+                        key_pattern.attrs.clone()
                     } else {
                         Vec::new()
                     },
-                };
-                let expanded_entry = Entry {
-                    key: expanded_key,
-                    value: unit_value.clone(),
-                    attrs: if i == 0 {
-                        key.attrs.clone()
-                    } else {
-                        Vec::new()
-                    },
-                };
-                expanded_entries.push(expanded_entry);
+                });
             }
         }
 
-        check_duplicates(&expanded_entries)?;
-        Ok(Set(expanded_entries))
+        check_duplicates(&entries)?;
+        Ok(Set(entries))
     }
 }
 
 fn check_duplicates(entries: &[Entry]) -> parse::Result<()> {
     let mut keys = HashSet::new();
     for entry in entries {
-        if let Some(first) = entry.key.parsed.first() {
-            if !keys.insert(first) {
-                return Err(Error::new_spanned(&entry.key.expr[0], "duplicate key"));
-            }
+        if !keys.insert(&entry.parsed_key) {
+            return Err(Error::new_spanned(&entry.key_expr, "duplicate key"));
         }
     }
     Ok(())
@@ -443,8 +392,8 @@ fn build_map(entries: &[Entry], state: HashState) -> proc_macro2::TokenStream {
         let disps = state.disps.iter().map(|&(d1, d2)| quote!((#d1, #d2)));
         let entries = state.map.iter().map(|&idx| {
             let entry = &entries[idx];
-            let key = &entry.key.expr[0];
-            let value = &entry.value;
+            let key = &entry.key_expr;
+            let value = &entry.value_expr;
             quote!((#key, #value))
         });
 
@@ -464,8 +413,8 @@ fn build_map(entries: &[Entry], state: HashState) -> proc_macro2::TokenStream {
         let remap = state.remap.iter().map(|index| quote!(#index));
         let entries = state.map.iter().map(|&idx| {
             let entry = &entries[idx];
-            let key = &entry.key.expr[0];
-            let value = &entry.value;
+            let key = &entry.key_expr;
+            let value = &entry.value_expr;
             quote!((#key, #value))
         });
 
@@ -487,8 +436,8 @@ fn build_ordered_map(entries: &[Entry], state: HashState) -> proc_macro2::TokenS
         let disps = state.disps.iter().map(|&(d1, d2)| quote!((#d1, #d2)));
         let idxs = state.map.iter().map(|idx| quote!(#idx));
         let entries = entries.iter().map(|entry| {
-            let key = &entry.key.expr[0];
-            let value = &entry.value;
+            let key = &entry.key_expr;
+            let value = &entry.value_expr;
             quote!((#key, #value))
         });
 
@@ -509,8 +458,8 @@ fn build_ordered_map(entries: &[Entry], state: HashState) -> proc_macro2::TokenS
         let remap = state.remap.iter().map(|index| quote!(#index));
         let idxs = state.map.iter().map(|idx| quote!(#idx));
         let entries = entries.iter().map(|entry| {
-            let key = &entry.key.expr[0];
-            let value = &entry.value;
+            let key = &entry.key_expr;
+            let value = &entry.value_expr;
             quote!((#key, #value))
         });
 
